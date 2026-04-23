@@ -1,49 +1,77 @@
 import asyncio
 import aiohttp
+import logging
 from datetime import datetime
-from typing import Optional
-from aiogram import Bot, Dispatcher, types
+from typing import Optional, Set
+from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import Command
-from aiogram.types import ReplyKeyboardMarkup, KeyboardButton
+from aiogram.types import (
+    ReplyKeyboardMarkup, 
+    KeyboardButton, 
+    InlineKeyboardMarkup, 
+    InlineKeyboardButton,
+    WebAppInfo
+)
+from aiogram.enums import ParseMode
 
-# Конфигурация
-WB_API_TOKEN = ""  # Вставьте ваш токен для категории "Поставки"
-TG_BOT_TOKEN = "8658224553:AAGE9O-wMIgeIcMaL9YH3IJsKL6fwMYgT1Y"
-TG_CHAT_ID = ""  # Вставьте ваш chat_id (можно узнать через @userinfobot)
+from config import (
+    WB_API_TOKEN,
+    TG_BOT_TOKEN,
+    TG_CHAT_ID,
+    CHECK_INTERVAL,
+    MONITOR_WAREHOUSE_IDS,
+    LOG_LEVEL,
+    LOG_FILE
+)
 
-# Интервал проверки в секундах (увеличено до 60 сек из-за лимитов API WB)
-# Лимит: 6 запросов в минуту на метод /warehouses
-CHECK_INTERVAL = 60
-
-# ID складов для мониторинга (по умолчанию все активные)
-MONITOR_WAREHOUSE_IDS: list[int] = []  # Оставьте пустым для всех складов или укажите конкретные [507, 123456]
+# Настройка логирования
+logging.basicConfig(
+    level=getattr(logging, LOG_LEVEL),
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    handlers=[
+        logging.FileHandler(LOG_FILE, encoding="utf-8"),
+        logging.StreamHandler()
+    ]
+)
+logger = logging.getLogger(__name__)
 
 
 class WildberriesMonitor:
     def __init__(self):
         self.base_url = "https://supplies-api.wildberries.ru/api/v1"
         self.session: Optional[aiohttp.ClientSession] = None
-        self.last_notified_slots: set = set()
+        self.last_notified_slots: Set[str] = set()
         self.is_monitoring = False
         self.monitor_task: Optional[asyncio.Task] = None
         self.bot: Optional[Bot] = None
         self.warehouses_cache: list[dict] = []
         self.cache_timestamp: float = 0
         self.cache_ttl = 300  # Кэш складов на 5 минут
+        self.stats = {
+            "total_checks": 0,
+            "slots_found": 0,
+            "notifications_sent": 0,
+            "errors": 0,
+            "start_time": None
+        }
 
     async def start(self):
         """Инициализация сессии"""
+        logger.info("Инициализация сессии API Wildberries")
         self.session = aiohttp.ClientSession(
             headers={"Authorization": self._get_api_token()}
         )
+        self.stats["start_time"] = datetime.now()
 
     async def stop(self):
         """Закрытие сессии"""
+        logger.info("Закрытие сессии API Wildberries")
         if self.session:
             await self.session.close()
 
     def _get_api_token(self) -> str:
         if not WB_API_TOKEN:
+            logger.error("WB_API_TOKEN не установлен!")
             raise ValueError("WB_API_TOKEN не установлен!")
         return WB_API_TOKEN
 
@@ -53,6 +81,7 @@ class WildberriesMonitor:
         
         # Возвращаем кэш если он ещё актуален
         if self.warehouses_cache and (now - self.cache_timestamp) < self.cache_ttl:
+            logger.debug(f"Используем кэш складов (возраст: {int(now - self.cache_timestamp)} сек.)")
             return self.warehouses_cache
 
         url = f"{self.base_url}/warehouses"
@@ -60,18 +89,23 @@ class WildberriesMonitor:
         
         for attempt in range(max_retries):
             try:
+                logger.debug(f"Запрос складов (попытка {attempt + 1}/{max_retries})")
                 async with self.session.get(url) as response:
                     if response.status == 200:
                         data = await response.json()
                         self.warehouses_cache = data
                         self.cache_timestamp = now
+                        logger.info(f"Получено {len(data)} складов")
                         return data
                     elif response.status == 429:
-                        wait_time = 60 * (attempt + 1)  # Экспоненциальная задержка
+                        wait_time = 60 * (attempt + 1)
+                        logger.warning(f"Rate limit, ждём {wait_time} сек.")
                         await asyncio.sleep(wait_time)
                     else:
+                        logger.error(f"Ошибка API WB: статус {response.status}")
                         return []
-            except Exception:
+            except Exception as e:
+                logger.error(f"Ошибка при получении складов: {e}")
                 if attempt < max_retries - 1:
                     await asyncio.sleep(5)
                 else:
@@ -98,10 +132,13 @@ class WildberriesMonitor:
                         return await response.json()
                     elif response.status == 429:
                         wait_time = 60 * (attempt + 1)
+                        logger.warning(f"Rate limit на acceptance/options, ждём {wait_time} сек.")
                         await asyncio.sleep(wait_time)
                     else:
+                        logger.debug(f"Ошибка API при получении опций: статус {response.status}")
                         return {}
-            except Exception:
+            except Exception as e:
+                logger.error(f"Ошибка при получении опций приёмки: {e}")
                 if attempt < max_retries - 1:
                     await asyncio.sleep(5)
                 else:
@@ -139,34 +176,43 @@ class WildberriesMonitor:
                         }
                         available_slots.append(slot_info)
 
+        self.stats["total_checks"] += 1
+        self.stats["slots_found"] += len(available_slots)
+        logger.info(f"Найдено {len(available_slots)} доступных слотов")
         return available_slots
 
     def _generate_slot_key(self, slot: dict) -> str:
         """Генерация уникального ключа для слота"""
-        return f"{slot['warehouse_id']}_{slot.get('warehouse_name', '')}"
+        details = slot.get('details', {})
+        slot_date = details.get('date', '') if isinstance(details, dict) else ''
+        return f"{slot['warehouse_id']}_{slot['warehouse_name']}_{slot_date}"
 
-    async def send_telegram_message(self, message: str):
+    async def send_telegram_message(self, message: str, parse_mode: str = "HTML"):
         """Отправка сообщения в Telegram"""
         if not TG_CHAT_ID:
+            logger.warning("TG_CHAT_ID не установлен, сообщение не отправлено")
             return
 
         url = f"https://api.telegram.org/bot{TG_BOT_TOKEN}/sendMessage"
         payload = {
             "chat_id": TG_CHAT_ID,
             "text": message,
-            "parse_mode": "HTML"
+            "parse_mode": parse_mode
         }
 
         try:
             async with aiohttp.ClientSession() as session:
                 async with session.post(url, json=payload) as response:
                     if response.status != 200:
-                        pass
-        except Exception:
-            pass
+                        logger.error(f"Ошибка отправки сообщения: {response.status}")
+                    else:
+                        self.stats["notifications_sent"] += 1
+        except Exception as e:
+            logger.error(f"Ошибка при отправке сообщения: {e}")
 
     async def monitor_loop(self):
         """Основной цикл мониторинга"""
+        logger.info("Запуск цикла мониторинга")
         while self.is_monitoring:
             try:
                 slots = await self.check_available_slots()
@@ -187,12 +233,20 @@ class WildberriesMonitor:
                                     TG_CHAT_ID, 
                                     f"✅ Найдено: {slot['warehouse_name']}"
                                 )
+                            logger.info(f"Уведомление отправлено: {slot['warehouse_name']}")
                     
                     self.last_notified_slots = current_slots
                 else:
+                    if self.last_notified_slots:
+                        logger.info("Слоты исчезли, очистка истории")
                     self.last_notified_slots.clear()
 
+            except asyncio.CancelledError:
+                logger.info("Цикл мониторинга остановлен")
+                break
             except Exception as e:
+                self.stats["errors"] += 1
+                logger.error(f"Ошибка в цикле мониторинга: {e}")
                 if self.bot:
                     await self.bot.send_message(TG_CHAT_ID, f"❌ Ошибка: {e}")
 
@@ -201,15 +255,20 @@ class WildberriesMonitor:
 
     def _format_notification(self, slot: dict) -> str:
         """Форматирование уведомления"""
+        details = slot.get('details', {})
+        date_info = ""
+        if isinstance(details, dict) and details.get('date'):
+            date_info = f"\n📅 <b>Дата:</b> {details.get('date', '')}"
+        
         return f"""
 🔔 <b>Доступен слот для отгрузки!</b>
 
 📦 <b>Склад:</b> {slot['warehouse_name']}
 🆔 <b>ID:</b> {slot['warehouse_id']}
 📍 <b>Адрес:</b> {slot['address']}
-⏰ <b>Режим работы:</b> {slot['work_time']}
+⏰ <b>Режим работы:</b> {slot['work_time']}{date_info}
 
-⚡️ Успейте записаться!
+⚡️ <b>Успейте записаться!</b>
         """.strip()
 
     async def start_monitoring(self, bot: Bot):
@@ -222,7 +281,12 @@ class WildberriesMonitor:
         self.bot = bot
         await self.start()
         self.monitor_task = asyncio.create_task(self.monitor_loop())
-        await bot.send_message(TG_CHAT_ID, "🚀 Мониторинг запущен!\n\nТеперь я проверяю склады WB и сообщу о свободных слотах.")
+        logger.info("Мониторинг запущен пользователем")
+        await bot.send_message(
+            TG_CHAT_ID, 
+            "🚀 <b>Мониторинг запущен!</b>\n\nТеперь я проверяю склады WB и сообщу о свободных слотах.",
+            parse_mode=ParseMode.HTML
+        )
 
     async def stop_monitoring(self, bot: Bot):
         """Остановка мониторинга"""
@@ -241,7 +305,8 @@ class WildberriesMonitor:
         await self.stop()
         self.monitor_task = None
         self.bot = None
-        await bot.send_message(TG_CHAT_ID, "⏸️ Мониторинг остановлен.")
+        logger.info("Мониторинг остановлен пользователем")
+        await bot.send_message(TG_CHAT_ID, "⏸️ <b>Мониторинг остановлен.</b>", parse_mode=ParseMode.HTML)
 
     async def get_status(self, bot: Bot):
         """Получение статуса мониторинга"""

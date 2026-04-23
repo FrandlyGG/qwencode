@@ -123,7 +123,7 @@ async def cmd_city(message: Message, state: FSMContext):
                         parse_mode=ParseMode.HTML, reply_markup=get_cancel_keyboard())
     await state.set_state(CityState.waiting_for_city)
 
-@router.message(CityState.waiting_for_city, F.text == "❌ Отмена")
+@router.message(CityState.waiting_for_city, F.text.casefold() == "❌ отмена".casefold())
 async def cancel_city(message: Message, state: FSMContext):
     await state.clear()
     await message.answer("Отменено", reply_markup=get_main_keyboard())
@@ -150,7 +150,8 @@ async def btn_help(message: Message):
 async def btn_status(message: Message):
     await message.answer(get_status_text(), parse_mode=ParseMode.HTML)
 
-@router.message(Command("start_monitoring") | F.text == "▶️ Запустить мониторинг")
+@router.message(Command("start_monitoring"))
+@router.message(F.text == "▶️ Запустить мониторинг")
 async def start_mon(message: Message):
     global is_monitoring, monitor_task, start_time
     if is_monitoring:
@@ -163,7 +164,8 @@ async def start_mon(message: Message):
     monitor_task = asyncio.create_task(monitor_loop())
     logger.info("Мониторинг старт")
 
-@router.message(Command("stop_monitoring") | F.text == "⏸️ Остановить мониторинг")
+@router.message(Command("stop_monitoring"))
+@router.message(F.text == "⏸️ Остановить мониторинг")
 async def stop_mon(message: Message):
     global is_monitoring, monitor_task
     if not is_monitoring:
@@ -194,23 +196,26 @@ async def notify_users(text: str):
 async def monitor_loop():
     global check_count, found_slots, notification_count, error_count
     logger.info("Цикл старт")
+    await notify_users("🚀 <b>Мониторинг запущен!</b>")
     while is_monitoring:
         try:
             check_count += 1
             logger.debug(f"Проверка #{check_count}, город: {user_city}")
             warehouses = await get_warehouses()
             if not warehouses:
+                logger.warning("Список складов пуст")
                 await asyncio.sleep(10)
                 continue
+            logger.info(f"Получено {len(warehouses)} складов всего")
             current = []
-            for wh in warehouses[:10]:
+            for wh in warehouses:
                 name = wh.get('name', '')
                 addr = wh.get('address', '')
                 if user_city:
                     if user_city.lower() not in name.lower() and user_city.lower() not in addr.lower():
                         continue
                 current.append(wh)
-            logger.info(f"Найдено {len(current)} складов")
+            logger.info(f"Найдено {len(current)} складов в городе {user_city or 'без фильтра'}")
             new_slots = current if not found_slots or len(current) != len(found_slots) else []
             if new_slots:
                 found_slots = current
@@ -218,7 +223,7 @@ async def monitor_loop():
                 msg = f"🎉 <b>Слоты!</b>\nВсего: {len(new_slots)}\n\n"
                 for i, s in enumerate(new_slots[:5], 1):
                     msg += f"{i}. {s.get('name')}\n{s.get('address')}\n\n"
-                if len(new_slots) > 5: msg += f"... еще {len(new_slots)-5}\n"
+                if len(new_slots) > 5: msg += f"... ещё {len(new_slots)-5}\n"
                 await notify_users(msg)
             await asyncio.sleep(30)
         except asyncio.CancelledError:

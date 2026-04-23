@@ -1,6 +1,7 @@
 import asyncio
 import logging
 import sys
+import ssl
 from datetime import datetime
 from typing import Optional, Set
 
@@ -12,6 +13,10 @@ from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.types import Message, ReplyKeyboardMarkup, KeyboardButton
 from aiohttp import ClientSession, TCPConnector
+import urllib3
+
+# Отключаем предупреждения о SSL
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 try:
     from config import WB_API_TOKEN, TG_BOT_TOKEN, LOG_LEVEL
@@ -78,8 +83,14 @@ def get_status_text() -> str:
 async def init_api_session():
     global api_session
     if api_session is None or api_session.closed:
-        api_session = ClientSession(connector=TCPConnector(limit=10), headers={"Authorization": WB_API_TOKEN})
-        logger.info("API сессия создана")
+        # Создаем SSL контекст, который не проверяет сертификаты (только для supply-wb.ru)
+        ssl_context = ssl.create_default_context()
+        ssl_context.check_hostname = False
+        ssl_context.verify_mode = ssl.CERT_NONE
+        
+        connector = TCPConnector(limit=10, ssl=ssl_context)
+        api_session = ClientSession(connector=connector, headers={"Authorization": WB_API_TOKEN})
+        logger.info("API сессия создана (SSL отключен)")
 
 async def close_api_session():
     global api_session

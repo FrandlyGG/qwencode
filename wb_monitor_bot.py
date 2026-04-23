@@ -2,9 +2,9 @@ import asyncio
 import aiohttp
 import logging
 from datetime import datetime
-from typing import Optional, Set
+from typing import Optional, Set, List
 from aiogram import Bot, Dispatcher, types, F
-from aiogram.filters import Command
+from aiogram.filters import Command, StateFilter
 from aiogram.types import (
     ReplyKeyboardMarkup, 
     KeyboardButton, 
@@ -13,6 +13,8 @@ from aiogram.types import (
     WebAppInfo
 )
 from aiogram.enums import ParseMode
+from aiogram.fsm.state import State, StatesGroup
+from aiogram.fsm.context import FSMContext
 
 from config import (
     WB_API_TOKEN,
@@ -36,6 +38,10 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
+class CitySelection(StatesGroup):
+    waiting_for_city = State()
+
+
 class WildberriesMonitor:
     def __init__(self):
         self.base_url = "https://supplies-api.wildberries.ru/api/v1"
@@ -47,6 +53,7 @@ class WildberriesMonitor:
         self.warehouses_cache: list[dict] = []
         self.cache_timestamp: float = 0
         self.cache_ttl = 300  # Кэш складов на 5 минут
+        self.target_city: str = ""  # Город для фильтрации складов
         self.stats = {
             "total_checks": 0,
             "slots_found": 0,
@@ -75,12 +82,12 @@ class WildberriesMonitor:
             raise ValueError("WB_API_TOKEN не установлен!")
         return WB_API_TOKEN
 
-    async def get_warehouses(self) -> list[dict]:
+    async def get_warehouses(self, force_refresh: bool = False) -> list[dict]:
         """Получение списка складов с кэшированием"""
         now = asyncio.get_event_loop().time()
         
-        # Возвращаем кэш если он ещё актуален
-        if self.warehouses_cache and (now - self.cache_timestamp) < self.cache_ttl:
+        # Возвращаем кэш если он ещё актуален и не запрошено обновление
+        if self.warehouses_cache and (now - self.cache_timestamp) < self.cache_ttl and not force_refresh:
             logger.debug(f"Используем кэш складов (возраст: {int(now - self.cache_timestamp)} сек.)")
             return self.warehouses_cache
 
@@ -160,6 +167,12 @@ class WildberriesMonitor:
             if MONITOR_WAREHOUSE_IDS and warehouse["ID"] not in MONITOR_WAREHOUSE_IDS:
                 continue
 
+            # Фильтрация по городу если указан
+            if self.target_city:
+                warehouse_city = warehouse.get("city", "") or warehouse.get("address", "")
+                if self.target_city.lower() not in warehouse_city.lower():
+                    continue
+
             # Проверяем опции приёмки для каждого склада
             options = await self.get_acceptance_options(warehouse_id=warehouse["ID"])
             
@@ -178,7 +191,8 @@ class WildberriesMonitor:
 
         self.stats["total_checks"] += 1
         self.stats["slots_found"] += len(available_slots)
-        logger.info(f"Найдено {len(available_slots)} доступных слотов")
+        logger.info(f"Найдено {len(available_slots)} доступных слотов" + 
+                   (f" в городе '{self.target_city}'" if self.target_city else ""))
         return available_slots
 
     def _generate_slot_key(self, slot: dict) -> str:
@@ -229,10 +243,13 @@ class WildberriesMonitor:
                             message = self._format_notification(slot)
                             await self.send_telegram_message(message)
                             if self.bot:
-                                await self.bot.send_message(
-                                    TG_CHAT_ID, 
-                                    f"✅ Найдено: {slot['warehouse_name']}"
-                                )
+                                try:
+                                    await self.bot.send_message(
+                                        TG_CHAT_ID, 
+                                        f"✅ Найдено: {slot['warehouse_name']}"
+                                    )
+                                except Exception as e:
+                                    logger.error(f"Ошибка отправки уведомления: {e}")
                             logger.info(f"Уведомление отправлено: {slot['warehouse_name']}")
                     
                     self.last_notified_slots = current_slots
@@ -271,10 +288,13 @@ class WildberriesMonitor:
 ⚡️ <b>Успейте записаться!</b>
         """.strip()
 
-    async def start_monitoring(self, bot: Bot):
+    async def start_monitoring(self, bot: Bot, chat_id: Optional[str] = None):
         """Запуск мониторинга"""
         if self.is_monitoring:
-            await bot.send_message(TG_CHAT_ID, "⚠️ Мониторинг уже запущен!")
+            await bot.send_message(
+                chat_id or TG_CHAT_ID, 
+                "⚠️ Мониторинг уже запущен!"
+            )
             return
         
         self.is_monitoring = True
@@ -282,16 +302,21 @@ class WildberriesMonitor:
         await self.start()
         self.monitor_task = asyncio.create_task(self.monitor_loop())
         logger.info("Мониторинг запущен пользователем")
+        
+        city_info = f" для города '{self.target_city}'" if self.target_city else ""
         await bot.send_message(
-            TG_CHAT_ID, 
-            "🚀 <b>Мониторинг запущен!</b>\n\nТеперь я проверяю склады WB и сообщу о свободных слотах.",
+            chat_id or TG_CHAT_ID, 
+            f"🚀 <b>Мониторинг запущен{city_info}!</b>\n\nТеперь я проверяю склады WB и сообщу о свободных слотах.",
             parse_mode=ParseMode.HTML
         )
 
-    async def stop_monitoring(self, bot: Bot):
+    async def stop_monitoring(self, bot: Bot, chat_id: Optional[str] = None):
         """Остановка мониторинга"""
         if not self.is_monitoring:
-            await bot.send_message(TG_CHAT_ID, "⚠️ Мониторинг не запущен!")
+            await bot.send_message(
+                chat_id or TG_CHAT_ID, 
+                "⚠️ Мониторинг не запущен!"
+            )
             return
         
         self.is_monitoring = False
@@ -306,24 +331,45 @@ class WildberriesMonitor:
         self.monitor_task = None
         self.bot = None
         logger.info("Мониторинг остановлен пользователем")
-        await bot.send_message(TG_CHAT_ID, "⏸️ <b>Мониторинг остановлен.</b>", parse_mode=ParseMode.HTML)
+        await bot.send_message(
+            chat_id or TG_CHAT_ID, 
+            "⏸️ <b>Мониторинг остановлен.</b>", 
+            parse_mode=ParseMode.HTML
+        )
 
-    async def get_status(self, bot: Bot):
+    async def get_status(self, bot: Bot, chat_id: Optional[str] = None):
         """Получение статуса мониторинга"""
         status = "🟢 Активен" if self.is_monitoring else "🔴 Остановлен"
         warehouses_count = len(self.warehouses_cache)
         cache_age = int(asyncio.get_event_loop().time() - self.cache_timestamp) if self.cache_timestamp > 0 else 0
         
+        city_info = f"\nГород: {self.target_city}" if self.target_city else "\nГород: Все города"
+        
         message = f"""
 📊 <b>Статус мониторинга</b>
 
-Статус: {status}
+Статус: {status}{city_info}
 Складов в кэше: {warehouses_count}
 Возраст кэша: {cache_age} сек.
 Интервал проверки: {CHECK_INTERVAL} сек.
         """.strip()
         
-        await bot.send_message(TG_CHAT_ID, message, parse_mode="HTML")
+        await bot.send_message(chat_id or TG_CHAT_ID, message, parse_mode="HTML")
+
+    async def set_city(self, bot: Bot, chat_id: str, city: str):
+        """Установка города для мониторинга"""
+        self.target_city = city.strip()
+        # Очищаем кэш складов чтобы применить фильтр города
+        self.warehouses_cache = []
+        self.cache_timestamp = 0
+        
+        if self.target_city:
+            message = f"✅ <b>Город установлен: {self.target_city}</b>\n\nТеперь будут показываться только склады в этом городе."
+        else:
+            message = "✅ <b>Фильтр города снят</b>\n\nТеперь будут показываться все склады."
+        
+        await bot.send_message(chat_id, message, parse_mode=ParseMode.HTML)
+        logger.info(f"Город установлен: {self.target_city if self.target_city else 'Все города'}")
 
 
 async def main():
@@ -337,7 +383,8 @@ async def main():
     kb = ReplyKeyboardMarkup(
         keyboard=[
             [KeyboardButton(text="▶️ Запустить"), KeyboardButton(text="⏸️ Остановить")],
-            [KeyboardButton(text="📊 Статус")]
+            [KeyboardButton(text="📊 Статус"), KeyboardButton(text="🌍 Выбрать город")],
+            [KeyboardButton(text="❓ Помощь")]
         ],
         resize_keyboard=True
     )
@@ -349,37 +396,130 @@ async def main():
             "Используйте кнопки ниже или команды:\n"
             "/start_monitoring - Запустить мониторинг\n"
             "/stop_monitoring - Остановить мониторинг\n"
-            "/status - Показать статус",
+            "/status - Показать статус\n"
+            "/city - Установить город для поиска\n"
+            "/help - Помощь",
             reply_markup=kb
         )
     
     @dp.message(Command("start_monitoring"))
     async def cmd_start_monitoring(message: types.Message):
         await message.answer("⏳ Запускаю мониторинг...")
-        await monitor.start_monitoring(bot)
+        await monitor.start_monitoring(bot, message.chat.id)
     
     @dp.message(Command("stop_monitoring"))
     async def cmd_stop_monitoring(message: types.Message):
         await message.answer("⏳ Останавливаю мониторинг...")
-        await monitor.stop_monitoring(bot)
+        await monitor.stop_monitoring(bot, message.chat.id)
     
     @dp.message(Command("status"))
     async def cmd_status(message: types.Message):
-        await monitor.get_status(bot)
+        await monitor.get_status(bot, message.chat.id)
     
-    @dp.message(lambda msg: msg.text == "▶️ Запустить")
+    @dp.message(Command("city"))
+    async def cmd_city(message: types.Message):
+        await message.answer(
+            "🌍 <b>Выбор города</b>\n\n"
+            "Введите название города для фильтрации складов.\n"
+            "Например: <i>Москва</i>, <i>Санкт-Петербург</i>, <i>Казань</i>\n\n"
+            "Отправьте пустое сообщение чтобы снять фильтр.",
+            parse_mode=ParseMode.HTML
+        )
+        await dp.storage.set_state(message.from_user.id, CitySelection.waiting_for_city)
+    
+    @dp.message(Command("help"))
+    async def cmd_help(message: types.Message):
+        help_text = """
+📚 <b>Помощь по боту</b>
+
+<b>Основные команды:</b>
+/start - Главное меню
+/start_monitoring - Запустить мониторинг
+/stop_monitoring - Остановить мониторинг
+/status - Показать текущий статус
+/city - Установить город для поиска
+/help - Эта справка
+
+<b>Как это работает:</b>
+1. Бот периодически проверяет API Wildberries
+2. Ищет доступные слоты для отгрузки
+3. Отправляет уведомления о новых слотах
+
+<b>Фильтр по городу:</b>
+Используйте команду /city чтобы указать город.
+Бот будет показывать только склады в этом городе.
+
+<b>Кнопки:</b>
+▶️ Запустить - старт мониторинга
+⏸️ Остановить - остановка мониторинга
+📊 Статус - информация о работе
+🌍 Выбрать город - установка фильтра
+❓ Помощь - эта справка
+        """.strip()
+        await message.answer(help_text, parse_mode=ParseMode.HTML)
+    
+    # Обработчик ввода города
+    @dp.message(StateFilter(CitySelection.waiting_for_city))
+    async def process_city_input(message: types.Message, state: FSMContext):
+        city = message.text.strip() if message.text else ""
+        await monitor.set_city(bot, message.chat.id, city)
+        await state.clear()
+    
+    @dp.message(F.text == "▶️ Запустить")
     async def btn_start(message: types.Message):
         await message.answer("⏳ Запускаю мониторинг...")
-        await monitor.start_monitoring(bot)
+        await monitor.start_monitoring(bot, message.chat.id)
     
-    @dp.message(lambda msg: msg.text == "⏸️ Остановить")
+    @dp.message(F.text == "⏸️ Остановить")
     async def btn_stop(message: types.Message):
         await message.answer("⏳ Останавливаю мониторинг...")
-        await monitor.stop_monitoring(bot)
+        await monitor.stop_monitoring(bot, message.chat.id)
     
-    @dp.message(lambda msg: msg.text == "📊 Статус")
+    @dp.message(F.text == "📊 Статус")
     async def btn_status(message: types.Message):
-        await monitor.get_status(bot)
+        await monitor.get_status(bot, message.chat.id)
+    
+    @dp.message(F.text == "🌍 Выбрать город")
+    async def btn_city(message: types.Message):
+        await message.answer(
+            "🌍 <b>Выбор города</b>\n\n"
+            "Введите название города для фильтрации складов.\n"
+            "Например: <i>Москва</i>, <i>Санкт-Петербург</i>, <i>Казань</i>\n\n"
+            "Отправьте пустое сообщение чтобы снять фильтр.",
+            parse_mode=ParseMode.HTML
+        )
+        await dp.storage.set_state(message.from_user.id, CitySelection.waiting_for_city)
+    
+    @dp.message(F.text == "❓ Помощь")
+    async def btn_help(message: types.Message):
+        help_text = """
+📚 <b>Помощь по боту</b>
+
+<b>Основные команды:</b>
+/start - Главное меню
+/start_monitoring - Запустить мониторинг
+/stop_monitoring - Остановить мониторинг
+/status - Показать текущий статус
+/city - Установить город для поиска
+/help - Эта справка
+
+<b>Как это работает:</b>
+1. Бот периодически проверяет API Wildberries
+2. Ищет доступные слоты для отгрузки
+3. Отправляет уведомления о новых слотах
+
+<b>Фильтр по городу:</b>
+Используйте команду /city чтобы указать город.
+Бот будет показывать только склады в этом городе.
+
+<b>Кнопки:</b>
+▶️ Запустить - старт мониторинга
+⏸️ Остановить - остановка мониторинга
+📊 Статус - информация о работе
+🌍 Выбрать город - установка фильтра
+❓ Помощь - эта справка
+        """.strip()
+        await message.answer(help_text, parse_mode=ParseMode.HTML)
     
     print("🤖 Бот запущен! Используйте /start для начала работы.")
     await dp.start_polling(bot)

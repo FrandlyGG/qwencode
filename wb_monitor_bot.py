@@ -2,14 +2,18 @@ import asyncio
 import aiohttp
 from datetime import datetime
 from typing import Optional
+from aiogram import Bot, Dispatcher, types
+from aiogram.filters import Command
+from aiogram.types import ReplyKeyboardMarkup, KeyboardButton
 
 # Конфигурация
 WB_API_TOKEN = ""  # Вставьте ваш токен для категории "Поставки"
 TG_BOT_TOKEN = "8658224553:AAGE9O-wMIgeIcMaL9YH3IJsKL6fwMYgT1Y"
 TG_CHAT_ID = ""  # Вставьте ваш chat_id (можно узнать через @userinfobot)
 
-# Интервал проверки в секундах (минимум 10 сек из-за лимитов API)
-CHECK_INTERVAL = 10
+# Интервал проверки в секундах (увеличено до 60 сек из-за лимитов API WB)
+# Лимит: 6 запросов в минуту на метод /warehouses
+CHECK_INTERVAL = 60
 
 # ID складов для мониторинга (по умолчанию все активные)
 MONITOR_WAREHOUSE_IDS: list[int] = []  # Оставьте пустым для всех складов или укажите конкретные [507, 123456]
@@ -20,6 +24,12 @@ class WildberriesMonitor:
         self.base_url = "https://supplies-api.wildberries.ru/api/v1"
         self.session: Optional[aiohttp.ClientSession] = None
         self.last_notified_slots: set = set()
+        self.is_monitoring = False
+        self.monitor_task: Optional[asyncio.Task] = None
+        self.bot: Optional[Bot] = None
+        self.warehouses_cache: list[dict] = []
+        self.cache_timestamp: float = 0
+        self.cache_ttl = 300  # Кэш складов на 5 минут
 
     async def start(self):
         """Инициализация сессии"""
@@ -38,18 +48,36 @@ class WildberriesMonitor:
         return WB_API_TOKEN
 
     async def get_warehouses(self) -> list[dict]:
-        """Получение списка складов"""
+        """Получение списка складов с кэшированием"""
+        now = asyncio.get_event_loop().time()
+        
+        # Возвращаем кэш если он ещё актуален
+        if self.warehouses_cache and (now - self.cache_timestamp) < self.cache_ttl:
+            return self.warehouses_cache
+
         url = f"{self.base_url}/warehouses"
-        async with self.session.get(url) as response:
-            if response.status == 200:
-                return await response.json()
-            elif response.status == 429:
-                print(f"⚠️ Слишком много запросов (429). Ждём...")
-                await asyncio.sleep(5)
-                return await self.get_warehouses()
-            else:
-                print(f"Ошибка получения складов: {response.status}")
-                return []
+        max_retries = 3
+        
+        for attempt in range(max_retries):
+            try:
+                async with self.session.get(url) as response:
+                    if response.status == 200:
+                        data = await response.json()
+                        self.warehouses_cache = data
+                        self.cache_timestamp = now
+                        return data
+                    elif response.status == 429:
+                        wait_time = 60 * (attempt + 1)  # Экспоненциальная задержка
+                        await asyncio.sleep(wait_time)
+                    else:
+                        return []
+            except Exception:
+                if attempt < max_retries - 1:
+                    await asyncio.sleep(5)
+                else:
+                    return []
+        
+        return []
 
     async def get_acceptance_options(self, warehouse_id: Optional[int] = None, 
                                       barcode: str = "test", quantity: int = 1) -> dict:
@@ -61,16 +89,25 @@ class WildberriesMonitor:
             params["warehouseID"] = warehouse_id
 
         payload = [{"barcode": barcode, "quantity": quantity}]
+        max_retries = 3
         
-        async with self.session.post(url, params=params, json=payload) as response:
-            if response.status == 200:
-                return await response.json()
-            elif response.status == 429:
-                print(f"⚠️ Слишком много запросов (429). Ждём...")
-                await asyncio.sleep(5)
-                return await self.get_acceptance_options(warehouse_id, barcode, quantity)
-            else:
-                return {}
+        for attempt in range(max_retries):
+            try:
+                async with self.session.post(url, params=params, json=payload) as response:
+                    if response.status == 200:
+                        return await response.json()
+                    elif response.status == 429:
+                        wait_time = 60 * (attempt + 1)
+                        await asyncio.sleep(wait_time)
+                    else:
+                        return {}
+            except Exception:
+                if attempt < max_retries - 1:
+                    await asyncio.sleep(5)
+                else:
+                    return {}
+        
+        return {}
 
     async def check_available_slots(self) -> list[dict]:
         """Проверка доступных слотов для отгрузки"""
@@ -92,7 +129,6 @@ class WildberriesMonitor:
             if options and "result" in options:
                 for result in options["result"]:
                     # Проверяем, есть ли доступные слоты
-                    # Структура ответа может варьироваться, адаптируйте под реальный ответ
                     if result:
                         slot_info = {
                             "warehouse_id": warehouse["ID"],
@@ -112,7 +148,6 @@ class WildberriesMonitor:
     async def send_telegram_message(self, message: str):
         """Отправка сообщения в Telegram"""
         if not TG_CHAT_ID:
-            print(f"📩 Сообщение: {message}")
             return
 
         url = f"https://api.telegram.org/bot{TG_BOT_TOKEN}/sendMessage"
@@ -126,46 +161,43 @@ class WildberriesMonitor:
             async with aiohttp.ClientSession() as session:
                 async with session.post(url, json=payload) as response:
                     if response.status != 200:
-                        print(f"Ошибка отправки в Telegram: {response.status}")
-        except Exception as e:
-            print(f"Ошибка Telegram: {e}")
+                        pass
+        except Exception:
+            pass
 
-    async def monitor(self):
+    async def monitor_loop(self):
         """Основной цикл мониторинга"""
-        print("🚀 Запуск мониторинга складов WB...")
-        await self.start()
-
-        try:
-            while True:
-                try:
-                    slots = await self.check_available_slots()
+        while self.is_monitoring:
+            try:
+                slots = await self.check_available_slots()
+                
+                if slots:
+                    current_slots = set()
                     
-                    if slots:
-                        current_slots = set()
+                    for slot in slots:
+                        slot_key = self._generate_slot_key(slot)
+                        current_slots.add(slot_key)
                         
-                        for slot in slots:
-                            slot_key = self._generate_slot_key(slot)
-                            current_slots.add(slot_key)
-                            
-                            # Отправляем уведомление только о новых слотах
-                            if slot_key not in self.last_notified_slots:
-                                message = self._format_notification(slot)
-                                await self.send_telegram_message(message)
-                                print(f"✅ Найдено: {slot['warehouse_name']}")
-                        
-                        self.last_notified_slots = current_slots
-                    else:
-                        now = datetime.now().strftime("%H:%M:%S")
-                        print(f"[{now}] Доступных слотов нет")
-                        self.last_notified_slots.clear()
+                        # Отправляем уведомление только о новых слотах
+                        if slot_key not in self.last_notified_slots:
+                            message = self._format_notification(slot)
+                            await self.send_telegram_message(message)
+                            if self.bot:
+                                await self.bot.send_message(
+                                    TG_CHAT_ID, 
+                                    f"✅ Найдено: {slot['warehouse_name']}"
+                                )
+                    
+                    self.last_notified_slots = current_slots
+                else:
+                    self.last_notified_slots.clear()
 
-                except Exception as e:
-                    print(f"❌ Ошибка в цикле мониторинга: {e}")
+            except Exception as e:
+                if self.bot:
+                    await self.bot.send_message(TG_CHAT_ID, f"❌ Ошибка: {e}")
 
-                await asyncio.sleep(CHECK_INTERVAL)
-
-        finally:
-            await self.stop()
+            # Ждём следующий интервал проверки
+            await asyncio.sleep(CHECK_INTERVAL)
 
     def _format_notification(self, slot: dict) -> str:
         """Форматирование уведомления"""
@@ -180,14 +212,116 @@ class WildberriesMonitor:
 ⚡️ Успейте записаться!
         """.strip()
 
+    async def start_monitoring(self, bot: Bot):
+        """Запуск мониторинга"""
+        if self.is_monitoring:
+            await bot.send_message(TG_CHAT_ID, "⚠️ Мониторинг уже запущен!")
+            return
+        
+        self.is_monitoring = True
+        self.bot = bot
+        await self.start()
+        self.monitor_task = asyncio.create_task(self.monitor_loop())
+        await bot.send_message(TG_CHAT_ID, "🚀 Мониторинг запущен!\n\nТеперь я проверяю склады WB и сообщу о свободных слотах.")
+
+    async def stop_monitoring(self, bot: Bot):
+        """Остановка мониторинга"""
+        if not self.is_monitoring:
+            await bot.send_message(TG_CHAT_ID, "⚠️ Мониторинг не запущен!")
+            return
+        
+        self.is_monitoring = False
+        if self.monitor_task:
+            self.monitor_task.cancel()
+            try:
+                await self.monitor_task
+            except asyncio.CancelledError:
+                pass
+        
+        await self.stop()
+        self.monitor_task = None
+        self.bot = None
+        await bot.send_message(TG_CHAT_ID, "⏸️ Мониторинг остановлен.")
+
+    async def get_status(self, bot: Bot):
+        """Получение статуса мониторинга"""
+        status = "🟢 Активен" if self.is_monitoring else "🔴 Остановлен"
+        warehouses_count = len(self.warehouses_cache)
+        cache_age = int(asyncio.get_event_loop().time() - self.cache_timestamp) if self.cache_timestamp > 0 else 0
+        
+        message = f"""
+📊 <b>Статус мониторинга</b>
+
+Статус: {status}
+Складов в кэше: {warehouses_count}
+Возраст кэша: {cache_age} сек.
+Интервал проверки: {CHECK_INTERVAL} сек.
+        """.strip()
+        
+        await bot.send_message(TG_CHAT_ID, message, parse_mode="HTML")
+
 
 async def main():
     monitor = WildberriesMonitor()
-    await monitor.monitor()
+    
+    # Создаём бота
+    bot = Bot(token=TG_BOT_TOKEN)
+    dp = Dispatcher()
+    
+    # Кнопки управления
+    kb = ReplyKeyboardMarkup(
+        keyboard=[
+            [KeyboardButton(text="▶️ Запустить"), KeyboardButton(text="⏸️ Остановить")],
+            [KeyboardButton(text="📊 Статус")]
+        ],
+        resize_keyboard=True
+    )
+    
+    @dp.message(Command("start"))
+    async def cmd_start(message: types.Message):
+        await message.answer(
+            "👋 Привет! Я бот для мониторинга свободных слотов WB.\n\n"
+            "Используйте кнопки ниже или команды:\n"
+            "/start_monitoring - Запустить мониторинг\n"
+            "/stop_monitoring - Остановить мониторинг\n"
+            "/status - Показать статус",
+            reply_markup=kb
+        )
+    
+    @dp.message(Command("start_monitoring"))
+    async def cmd_start_monitoring(message: types.Message):
+        await message.answer("⏳ Запускаю мониторинг...")
+        await monitor.start_monitoring(bot)
+    
+    @dp.message(Command("stop_monitoring"))
+    async def cmd_stop_monitoring(message: types.Message):
+        await message.answer("⏳ Останавливаю мониторинг...")
+        await monitor.stop_monitoring(bot)
+    
+    @dp.message(Command("status"))
+    async def cmd_status(message: types.Message):
+        await monitor.get_status(bot)
+    
+    @dp.message(lambda msg: msg.text == "▶️ Запустить")
+    async def btn_start(message: types.Message):
+        await message.answer("⏳ Запускаю мониторинг...")
+        await monitor.start_monitoring(bot)
+    
+    @dp.message(lambda msg: msg.text == "⏸️ Остановить")
+    async def btn_stop(message: types.Message):
+        await message.answer("⏳ Останавливаю мониторинг...")
+        await monitor.stop_monitoring(bot)
+    
+    @dp.message(lambda msg: msg.text == "📊 Статус")
+    async def btn_status(message: types.Message):
+        await monitor.get_status(bot)
+    
+    print("🤖 Бот запущен! Используйте /start для начала работы.")
+    await dp.start_polling(bot)
 
 
 if __name__ == "__main__":
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
-        print("\n👋 Мониторинг остановлен пользователем")
+        print("\n👋 Бот остановлен пользователем")

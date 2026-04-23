@@ -18,12 +18,24 @@ import urllib3
 # Отключаем предупреждения о SSL
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
+# Проверка токенов
 try:
     from config import WB_API_TOKEN, TG_BOT_TOKEN, LOG_LEVEL
 except ImportError:
-    WB_API_TOKEN = "YOUR_WB_TOKEN"
-    TG_BOT_TOKEN = "YOUR_BOT_TOKEN"
+    WB_API_TOKEN = ""
+    TG_BOT_TOKEN = ""
     LOG_LEVEL = "DEBUG"
+
+if not WB_API_TOKEN or WB_API_TOKEN == "YOUR_WB_TOKEN" or WB_API_TOKEN == "your_wb_api_token_here":
+    print("❌ ОШИБКА: Не указан токен Wildberries API!")
+    print("   Получите токен в личном кабинете селлера WB (категория 'Поставки')")
+    print("   и добавьте в файл .env: WB_API_TOKEN=ваш_токен")
+    sys.exit(1)
+
+if not TG_BOT_TOKEN or TG_BOT_TOKEN == "YOUR_BOT_TOKEN" or TG_BOT_TOKEN == "your_bot_token_here":
+    print("❌ ОШИБКА: Не указан токен Telegram бота!")
+    print("   Получите токен у @BotFather и добавьте в файл .env: TG_BOT_TOKEN=ваш_токен")
+    sys.exit(1)
 
 logging.basicConfig(
     level=getattr(logging, LOG_LEVEL.upper(), logging.DEBUG),
@@ -83,14 +95,14 @@ def get_status_text() -> str:
 async def init_api_session():
     global api_session
     if api_session is None or api_session.closed:
-        # Создаем SSL контекст, который не проверяет сертификаты (только для supply-wb.ru)
+        # Создаем SSL контекст для обхода проблем с сертификатами
         ssl_context = ssl.create_default_context()
         ssl_context.check_hostname = False
         ssl_context.verify_mode = ssl.CERT_NONE
         
         connector = TCPConnector(limit=10, ssl=ssl_context)
         api_session = ClientSession(connector=connector, headers={"Authorization": WB_API_TOKEN})
-        logger.info("API сессия создана (SSL отключен)")
+        logger.info("API сессия создана (SSL проверки отключены для отладки)")
 
 async def close_api_session():
     global api_session
@@ -102,7 +114,8 @@ async def get_warehouses() -> list:
     if not api_session:
         await init_api_session()
     try:
-        async with api_session.get("https://supply-wb.ru/api/v1/warehouses") as resp:
+        # Правильный URL согласно документации WB API
+        async with api_session.get("https://supplies-api.wildberries.ru/api/v1/warehouses") as resp:
             if resp.status == 200:
                 data = await resp.json()
                 logger.info(f"Получено {len(data)} складов")
@@ -247,9 +260,7 @@ async def monitor_loop():
 
 async def main():
     global current_bot
-    if TG_BOT_TOKEN == "YOUR_BOT_TOKEN":
-        logger.error("Нет токена!")
-        return
+    # Токены уже проверены при старте скрипта
     current_bot = Bot(token=TG_BOT_TOKEN)
     dp = Dispatcher(storage=MemoryStorage())
     dp.include_router(router)
@@ -261,6 +272,7 @@ async def main():
     finally:
         await close_api_session()
         await current_bot.session.close()
+        await current_bot.close()
 
 if __name__ == "__main__":
     asyncio.run(main())
